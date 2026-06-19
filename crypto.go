@@ -1,6 +1,8 @@
 package libtab
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/subtle"
@@ -142,3 +144,57 @@ func VerifySignature(cellVal string, pubKey ed25519.PublicKey) ([]byte, error) {
 
 	return body, nil
 }
+
+func EncryptBody(body []byte, key []byte) (string, error) {
+	if len(key) != 32 {
+		return "", fmt.Errorf("invalid key size: %d bytes, expected 32", len(key))
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, aesgcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	ciphertext := aesgcm.Seal(nil, nonce, body, nil)
+	wire := append(nonce, ciphertext...)
+	return "encrypted:" + B64Encode(wire), nil
+}
+
+func DecryptBody(cellVal string, key []byte) ([]byte, error) {
+	if len(key) != 32 {
+		return nil, fmt.Errorf("invalid key size: %d bytes, expected 32", len(key))
+	}
+	if !strings.HasPrefix(cellVal, "encrypted:") {
+		return nil, fmt.Errorf("missing encrypted: prefix")
+	}
+	wire, err := B64Decode(cellVal[len("encrypted:"):])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode encrypted base64 payload: %v", err)
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := aesgcm.NonceSize()
+	if len(wire) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce := wire[:nonceSize]
+	ciphertext := wire[nonceSize:]
+
+	return aesgcm.Open(nil, nonce, ciphertext, nil)
+}
+

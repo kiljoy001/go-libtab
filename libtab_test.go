@@ -198,7 +198,40 @@ func TestSignedColumns(t *testing.T) {
 	}
 }
 
+func TestEncryptedColumns(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	body := []byte("highly sensitive cookie session identifier")
+
+	encCell, err := EncryptBody(body, key)
+	if err != nil {
+		t.Fatalf("EncryptBody failed: %v", err)
+	}
+	if !strings.HasPrefix(encCell, "encrypted:") {
+		t.Errorf("wrong encrypted cell format: %s", encCell)
+	}
+
+	decrypted, err := DecryptBody(encCell, key)
+	if err != nil {
+		t.Fatalf("DecryptBody failed: %v", err)
+	}
+	if string(decrypted) != string(body) {
+		t.Errorf("decrypted body mismatch: %s vs %s", string(decrypted), string(body))
+	}
+
+	// Verify decryption failure with wrong key
+	wrongKey := make([]byte, 32)
+	wrongKey[0] = 99
+	_, err = DecryptBody(encCell, wrongKey)
+	if err == nil {
+		t.Errorf("DecryptBody succeeded with wrong key")
+	}
+}
+
 // Helpers
 func stringsContains(s, sub string) bool {
 	return strings.Contains(s, sub)
 }
+
