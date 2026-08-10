@@ -1,7 +1,6 @@
 package libtab
 
 import (
-	"crypto/ed25519"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +8,13 @@ import (
 )
 
 func TestNDBParser(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "libtab-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "users.tab")
 	input := `# This is a comment
 schema=users
 	col=user
@@ -17,26 +23,24 @@ schema=users
 user=alice
 	uid=1000
 `
-	tuples, err := parseNDB(strings.NewReader(input))
-	if err != nil {
-		t.Fatalf("parseNDB failed: %v", err)
-	}
-	if len(tuples) != 2 {
-		t.Fatalf("expected 2 tuples, got %d", len(tuples))
+	if err := os.WriteFile(dbPath, []byte(input), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	schema, err := parseSchema(tuples[0])
+	table, err := Open(dbPath)
 	if err != nil {
-		t.Fatalf("parseSchema failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
+	defer table.Close()
 
-	row, err := schema.ValidateRow(flattenTuple(tuples[1]))
-	if err != nil {
-		t.Fatalf("ValidateRow failed: %v", err)
+	if table.Schema.Name != "users" {
+		t.Fatalf("schema name = %q, want users", table.Schema.Name)
 	}
-
-	if row.Values["user"] != "alice" || row.Values["uid"] != "1000" {
-		t.Errorf("wrong row values: %+v", row.Values)
+	if len(table.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(table.Rows))
+	}
+	if table.Rows[0].Values["user"] != "alice" || table.Rows[0].Values["uid"] != "1000" {
+		t.Errorf("wrong row values: %+v", table.Rows[0].Values)
 	}
 }
 
@@ -55,6 +59,11 @@ func TestTableCreateAndCommit(t *testing.T) {
 	}
 
 	t1 := Create(dbPath, "users", cols)
+	if t1 == nil {
+		t.Fatalf("Create failed: %v", lastError())
+	}
+	defer t1.Close()
+
 	_, err = t1.AddRow(map[string]string{
 		"user":  "alice",
 		"uid":   "1000",
@@ -87,6 +96,7 @@ func TestTableCreateAndCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
+	defer t2.Close()
 
 	if t2.Schema.Name != "users" {
 		t.Errorf("schema name mismatch: %s", t2.Schema.Name)
@@ -160,9 +170,10 @@ func TestHashedColumns(t *testing.T) {
 }
 
 func TestSignedColumns(t *testing.T) {
-	pubKey, privKey, err := ed25519.GenerateKey(nil)
+	seed := []byte("0123456789abcdef0123456789abcdef")
+	pubKey, privKey, err := SigningKeyPairFromSeed(seed)
 	if err != nil {
-		t.Fatalf("GenerateKey failed: %v", err)
+		t.Fatalf("SigningKeyPairFromSeed failed: %v", err)
 	}
 
 	body := []byte("important audit log content")
@@ -184,14 +195,20 @@ func TestSignedColumns(t *testing.T) {
 	}
 
 	// Verify failure on tampered content
-	tamperedCell := strings.Replace(signedCell, "a", "b", 1)
+	tamperedCell := signedCell[:len(signedCell)-1] + "A"
+	if tamperedCell == signedCell {
+		tamperedCell = signedCell[:len(signedCell)-1] + "B"
+	}
 	_, err = VerifySignature(tamperedCell, pubKey)
 	if err == nil {
 		t.Errorf("VerifySignature succeeded on tampered cell")
 	}
 
 	// Verify failure with wrong public key
-	otherPubKey, _, _ := ed25519.GenerateKey(nil)
+	otherPubKey, _, err := SigningKeyPairFromSeed([]byte("abcdef0123456789abcdef0123456789"))
+	if err != nil {
+		t.Fatalf("SigningKeyPairFromSeed failed: %v", err)
+	}
 	_, err = VerifySignature(signedCell, otherPubKey)
 	if err == nil {
 		t.Errorf("VerifySignature succeeded with wrong public key")
@@ -200,33 +217,13 @@ func TestSignedColumns(t *testing.T) {
 
 func TestEncryptedColumns(t *testing.T) {
 	key := make([]byte, 32)
-	for i := range key {
-		key[i] = byte(i)
-	}
 	body := []byte("highly sensitive cookie session identifier")
 
-	encCell, err := EncryptBody(body, key)
-	if err != nil {
-		t.Fatalf("EncryptBody failed: %v", err)
+	if _, err := EncryptBody(body, key); err == nil {
+		t.Fatalf("EncryptBody succeeded, but C libtab has no ENCRYPTED cell type")
 	}
-	if !strings.HasPrefix(encCell, "encrypted:") {
-		t.Errorf("wrong encrypted cell format: %s", encCell)
-	}
-
-	decrypted, err := DecryptBody(encCell, key)
-	if err != nil {
-		t.Fatalf("DecryptBody failed: %v", err)
-	}
-	if string(decrypted) != string(body) {
-		t.Errorf("decrypted body mismatch: %s vs %s", string(decrypted), string(body))
-	}
-
-	// Verify decryption failure with wrong key
-	wrongKey := make([]byte, 32)
-	wrongKey[0] = 99
-	_, err = DecryptBody(encCell, wrongKey)
-	if err == nil {
-		t.Errorf("DecryptBody succeeded with wrong key")
+	if _, err := DecryptBody("encrypted:AAAA", key); err == nil {
+		t.Fatalf("DecryptBody succeeded, but C libtab has no ENCRYPTED cell type")
 	}
 }
 
@@ -234,4 +231,3 @@ func TestEncryptedColumns(t *testing.T) {
 func stringsContains(s, sub string) bool {
 	return strings.Contains(s, sub)
 }
-

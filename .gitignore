@@ -1,0 +1,6 @@
+# Compiled objects and archives
+*.o
+*.a
+
+# Test artefacts
+*.tab

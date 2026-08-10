@@ -1,200 +1,137 @@
 package libtab
 
+/*
+#cgo CFLAGS: -DPLAN9PORT -I${SRCDIR}/clibtab -I${SRCDIR} -I/usr/local/plan9/include
+
+#include <u.h>
+#include <libc.h>
+
+char *go_libtab_hash_blake2b(const unsigned char *preimage, int n);
+char *go_libtab_hash_argon2id(const unsigned char *preimage, int n);
+int go_libtab_verify_hash_cell(const char *cell, const unsigned char *preimage, int n);
+char *go_libtab_sign_body(const unsigned char *body, int n, const unsigned char *signer_sk);
+unsigned char *go_libtab_verify_signature_cell(const char *cell, const unsigned char *signer_pk, int *outlen);
+void go_libtab_eddsa_key_pair(unsigned char *secret_key, unsigned char *public_key, unsigned char *seed);
+*/
+import "C"
+
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/subtle"
 	"fmt"
-	"strings"
-
-	"golang.org/x/crypto/argon2"
-	"golang.org/x/crypto/blake2b"
-)
-
-const (
-	HashedDigest    = 32
-	HashedAlgoBlake = 0x01
-	HashedAlgoArgon = 0x02
-
-	Argon2dDefMlog2 = 16 // 64 MiB
-	Argon2dDefT     = 3
-	Argon2dDefP     = 1
-	Argon2dDefSalt  = 16
+	"unsafe"
 )
 
 func HashBlake2b(preimage []byte) (string, error) {
-	digest := blake2b.Sum256(preimage)
-	wire := make([]byte, 1+HashedDigest)
-	wire[0] = HashedAlgoBlake
-	copy(wire[1:], digest[:])
-	return "hashed:" + B64Encode(wire), nil
+	var in *C.uchar
+	if len(preimage) > 0 {
+		in = (*C.uchar)(unsafe.Pointer(&preimage[0]))
+	}
+
+	cell := C.go_libtab_hash_blake2b(in, C.int(len(preimage)))
+	if cell == nil {
+		return "", lastError()
+	}
+	defer freePlan9(unsafe.Pointer(cell))
+	return C.GoString(cell), nil
 }
 
 func HashArgon2id(preimage []byte) (string, error) {
-	salt := make([]byte, Argon2dDefSalt)
-	if _, err := rand.Read(salt); err != nil {
-		return "", fmt.Errorf("failed to generate secure salt: %v", err)
+	var in *C.uchar
+	if len(preimage) > 0 {
+		in = (*C.uchar)(unsafe.Pointer(&preimage[0]))
 	}
 
-	m := uint32(1 << Argon2dDefMlog2)
-	digest := argon2.IDKey(preimage, salt, Argon2dDefT, m, Argon2dDefP, HashedDigest)
-
-	wlen := 5 + Argon2dDefSalt + HashedDigest
-	wire := make([]byte, wlen)
-	wire[0] = HashedAlgoArgon
-	wire[1] = Argon2dDefMlog2
-	wire[2] = Argon2dDefT
-	wire[3] = Argon2dDefP
-	wire[4] = Argon2dDefSalt
-	copy(wire[5:], salt)
-	copy(wire[5+Argon2dDefSalt:], digest)
-
-	return "hashed:" + B64Encode(wire), nil
+	cell := C.go_libtab_hash_argon2id(in, C.int(len(preimage)))
+	if cell == nil {
+		return "", lastError()
+	}
+	defer freePlan9(unsafe.Pointer(cell))
+	return C.GoString(cell), nil
 }
 
 func VerifyHash(cellVal string, preimage []byte) (bool, error) {
-	if !strings.HasPrefix(cellVal, "hashed:") {
-		return false, fmt.Errorf("missing hashed: prefix")
-	}
-	b64Part := cellVal[len("hashed:"):]
-	wire, err := B64Decode(b64Part)
-	if err != nil {
-		return false, fmt.Errorf("failed to decode base64 cell: %v", err)
-	}
+	ccell := cString(cellVal)
+	defer freeCString(ccell)
 
-	if len(wire) == 0 {
-		return false, fmt.Errorf("empty hashed cell payload")
+	var in *C.uchar
+	if len(preimage) > 0 {
+		in = (*C.uchar)(unsafe.Pointer(&preimage[0]))
 	}
 
-	algo := wire[0]
-	switch algo {
-	case HashedAlgoBlake:
-		if len(wire) != 1+HashedDigest {
-			return false, fmt.Errorf("invalid blake2b wire length %d", len(wire))
-		}
-		digest := blake2b.Sum256(preimage)
-		return subtle.ConstantTimeCompare(wire[1:], digest[:]) == 1, nil
-
-	case HashedAlgoArgon:
-		if len(wire) < 5 {
-			return false, fmt.Errorf("invalid argon2id wire header")
-		}
-		mLog2 := wire[1]
-		t := wire[2]
-		p := wire[3]
-		saltLen := int(wire[4])
-
-		if len(wire) != 5+saltLen+HashedDigest {
-			return false, fmt.Errorf("invalid argon2id wire length %d, expected %d", len(wire), 5+saltLen+HashedDigest)
-		}
-
-		salt := wire[5 : 5+saltLen]
-		expectedDigest := wire[5+saltLen : 5+saltLen+HashedDigest]
-
-		m := uint32(1 << mLog2)
-		computedDigest := argon2.IDKey(preimage, salt, uint32(t), m, p, HashedDigest)
-
-		return subtle.ConstantTimeCompare(computedDigest, expectedDigest) == 1, nil
-
+	rc := C.go_libtab_verify_hash_cell(ccell, in, C.int(len(preimage)))
+	switch rc {
+	case 1:
+		return true, nil
+	case 0:
+		return false, nil
 	default:
-		return false, fmt.Errorf("unknown hash algorithm ID 0x%02x", algo)
+		return false, lastError()
 	}
 }
 
-func SignBody(body []byte, privKey ed25519.PrivateKey) (string, error) {
-	if len(privKey) != ed25519.PrivateKeySize {
+func SignBody(body []byte, privKey []byte) (string, error) {
+	if len(privKey) != 64 {
 		return "", fmt.Errorf("invalid private key size: %d", len(privKey))
 	}
-	sig := ed25519.Sign(privKey, body)
-	return fmt.Sprintf("signed:%s:%s", B64Encode(body), B64Encode(sig)), nil
+
+	var bodyPtr *C.uchar
+	if len(body) > 0 {
+		bodyPtr = (*C.uchar)(unsafe.Pointer(&body[0]))
+	}
+	keyPtr := (*C.uchar)(unsafe.Pointer(&privKey[0]))
+
+	cell := C.go_libtab_sign_body(bodyPtr, C.int(len(body)), keyPtr)
+	if cell == nil {
+		return "", lastError()
+	}
+	defer freePlan9(unsafe.Pointer(cell))
+	return C.GoString(cell), nil
 }
 
-func VerifySignature(cellVal string, pubKey ed25519.PublicKey) ([]byte, error) {
-	if len(pubKey) != ed25519.PublicKeySize {
+func VerifySignature(cellVal string, pubKey []byte) ([]byte, error) {
+	if len(pubKey) != 32 {
 		return nil, fmt.Errorf("invalid public key size: %d", len(pubKey))
 	}
-	if !strings.HasPrefix(cellVal, "signed:") {
-		return nil, fmt.Errorf("missing signed: prefix")
+
+	ccell := cString(cellVal)
+	defer freeCString(ccell)
+
+	var outLen C.int
+	keyPtr := (*C.uchar)(unsafe.Pointer(&pubKey[0]))
+	body := C.go_libtab_verify_signature_cell(ccell, keyPtr, &outLen)
+	if body == nil {
+		return nil, lastError()
+	}
+	defer freePlan9(unsafe.Pointer(body))
+
+	return C.GoBytes(unsafe.Pointer(body), outLen), nil
+}
+
+func SigningKeyPairFromSeed(seed []byte) (pubKey []byte, privKey []byte, err error) {
+	if len(seed) != 32 {
+		return nil, nil, fmt.Errorf("invalid seed size: %d", len(seed))
 	}
 
-	parts := strings.Split(cellVal[len("signed:"):], ":")
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid signed cell format, expected signed:<body_b64>:<sig_b64>")
-	}
+	var cpub [32]C.uchar
+	var cpriv [64]C.uchar
+	seedPtr := (*C.uchar)(unsafe.Pointer(&seed[0]))
 
-	body, err := B64Decode(parts[0])
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode signed body: %v", err)
-	}
+	C.go_libtab_eddsa_key_pair(&cpriv[0], &cpub[0], seedPtr)
+	return C.GoBytes(unsafe.Pointer(&cpub[0]), 32), C.GoBytes(unsafe.Pointer(&cpriv[0]), 64), nil
+}
 
-	sig, err := B64Decode(parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode signature: %v", err)
+func GenerateSigningKey() (pubKey []byte, privKey []byte, err error) {
+	seed := make([]byte, 32)
+	if _, err := rand.Read(seed); err != nil {
+		return nil, nil, err
 	}
-
-	if len(sig) != ed25519.SignatureSize {
-		return nil, fmt.Errorf("invalid signature size %d", len(sig))
-	}
-
-	if !ed25519.Verify(pubKey, body, sig) {
-		return nil, fmt.Errorf("signature verification failed")
-	}
-
-	return body, nil
+	return SigningKeyPairFromSeed(seed)
 }
 
 func EncryptBody(body []byte, key []byte) (string, error) {
-	if len(key) != 32 {
-		return "", fmt.Errorf("invalid key size: %d bytes, expected 32", len(key))
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
-	}
-	aesgcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	nonce := make([]byte, aesgcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return "", err
-	}
-	ciphertext := aesgcm.Seal(nil, nonce, body, nil)
-	wire := append(nonce, ciphertext...)
-	return "encrypted:" + B64Encode(wire), nil
+	return "", fmt.Errorf("ENCRYPTED cells are not supported by C libtab")
 }
 
 func DecryptBody(cellVal string, key []byte) ([]byte, error) {
-	if len(key) != 32 {
-		return nil, fmt.Errorf("invalid key size: %d bytes, expected 32", len(key))
-	}
-	if !strings.HasPrefix(cellVal, "encrypted:") {
-		return nil, fmt.Errorf("missing encrypted: prefix")
-	}
-	wire, err := B64Decode(cellVal[len("encrypted:"):])
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode encrypted base64 payload: %v", err)
-	}
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	aesgcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
-	nonceSize := aesgcm.NonceSize()
-	if len(wire) < nonceSize {
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-
-	nonce := wire[:nonceSize]
-	ciphertext := wire[nonceSize:]
-
-	return aesgcm.Open(nil, nonce, ciphertext, nil)
+	return nil, fmt.Errorf("ENCRYPTED cells are not supported by C libtab")
 }
-

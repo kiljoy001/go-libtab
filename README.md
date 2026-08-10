@@ -1,17 +1,22 @@
 # go-libtab
 
-A pure Go port of the 9lx `libtab` tabular database storage engine.
+A Go binding for the 9lx C `libtab` tabular database storage engine.
 
-`go-libtab` implements a schema-agnostic, typed-table storage substrate built on top of Plan 9's native `ndb` (network database) syntax. It guarantees human inspectability on disk while adding optional cryptographic columns (`HASHED` and `SIGNED`) for cell-level integrity.
+`go-libtab` exposes the C `libtab` implementation through cgo. The on-disk parser and table semantics come from plan9port `libndb`; cryptographic cell helpers use the bundled C Monocypher implementation.
 
 ## Features
 
 - **Plan 9 Native (Text-First)**: Data is stored on disk in raw, space-continuation `ndb` attribute-value syntax. You can edit files with `vi`, inspect with `cat`, and query with `grep`.
 - **Integrity Columns**:
   - `HASHED`: Cell values are irreversible digests (BLAKE2b or Argon2id).
-  - `SIGNED`: Cell values carry a body + Ed25519 signature verified at load time.
-- **In-Memory Querying**: Fast `O(1)` linear lookup using simple `Search(col, val)` and iterator APIs.
-- **Atomic Commits**: Persistence uses a standard write-to-tempfile, `fsync`, and atomic `rename` commit cycle.
+  - `SIGNED`: Cell values carry a body + Monocypher EdDSA signature verified at load time.
+- **In-Memory Querying**: Simple `Search(col, val)` over the C table iterator.
+- **Atomic Commits**: Local persistence uses a write-to-tempfile, `fsync`, and atomic `rename` commit cycle.
+
+## Requirements
+
+- cgo enabled
+- plan9port installed at `/usr/local/plan9`
 
 ## Installation
 
@@ -35,19 +40,16 @@ func main() {
 	cols := []libtab.Column{
 		{Name: "user"},
 		{Name: "uid"},
-		{Name: "pwhash", Type: "HASHED", Attrs: map[string]string{"algo": "argon2id"}},
+		{Name: "shell"},
 	}
 
 	table := libtab.Create("users.tab", "users", cols)
 
-	// Hash password preimage
-	pwHash, _ := libtab.HashArgon2id([]byte("secret123"))
-
 	// Add a row
 	table.AddRow(map[string]string{
-		"user":   "alice",
-		"uid":    "1000",
-		"pwhash": pwHash,
+		"user":  "alice",
+		"uid":   "1000",
+		"shell": "/bin/rc",
 	})
 
 	// Commit changes atomically to users.tab
@@ -73,12 +75,18 @@ func main() {
 	if len(rows) > 0 {
 		alice := rows[0]
 		fmt.Printf("UID: %s\n", alice.Values["uid"])
-
-		// Verify hashed column preimage
-		ok, _ := libtab.VerifyHash(alice.Values["pwhash"], []byte("secret123"))
-		if ok {
-			fmt.Println("Password is correct!")
-		}
 	}
 }
+```
+
+### 3. Hash and Signature Cells
+
+```go
+hashCell, _ := libtab.HashArgon2id([]byte("secret123"))
+ok, _ := libtab.VerifyHash(hashCell, []byte("secret123"))
+
+pub, priv, _ := libtab.GenerateSigningKey()
+signedCell, _ := libtab.SignBody([]byte("audit body"), priv)
+body, _ := libtab.VerifySignature(signedCell, pub)
+_, _ = ok, body
 ```
