@@ -115,16 +115,58 @@ canonical_bytes(Tab *t, Ndbtuple *chain, int *lenout)
 static int
 ensure_buckets(Tab *t, int target_rows)
 {
-	uint32_t nb;
+	uint32_t nb, old, i;
+	TabRow **nbuf, *e, *next;
 
-	if(t->buckets != nil)
-		return 0;
-	nb = nextpow2(target_rows > 0 ? (uint32_t)target_rows * 2 : HashMinBuckets);
-	t->buckets = mallocz(nb * sizeof *t->buckets, 1);
 	if(t->buckets == nil){
-		tab_seterror("tab_open: out of memory for row-hash buckets");
+		nb = nextpow2(target_rows > 0 ? (uint32_t)target_rows * 2
+		                              : HashMinBuckets);
+		t->buckets = mallocz(nb * sizeof *t->buckets, 1);
+		if(t->buckets == nil){
+			tab_seterror("tab_open: out of memory for row-hash "
+			             "buckets");
+			return -1;
+		}
+		t->mask = nb - 1;
+		return 0;
+	}
+
+	/*
+	 * Grow when the table passes one entry per bucket.
+	 *
+	 * This used to return early whenever buckets existed, so a table built
+	 * by tab_create -- which starts empty, so target_rows is 0 -- kept the
+	 * initial 16 buckets no matter how many rows arrived. At 160k rows
+	 * that is ~10k entries per bucket, and every "walk the bucket chain"
+	 * in this file becomes a full scan with a canonical_bytes() malloc per
+	 * step. Measured on sigil's store_commit:
+	 *
+	 *      5,000 records    0.07 s
+	 *     40,000 records    4.52 s
+	 *    160,000 records  126.71 s     <- 5.6x for 2x the rows
+	 *
+	 * with 85% of samples inside tab_rowmap_rehash_row, whose own loops
+	 * are O(chain). The chains were the problem, not the loops.
+	 */
+	if((uint32_t)t->nentries <= t->mask)
+		return 0;
+
+	old = t->mask + 1;
+	nb = old * 2;
+	nbuf = mallocz(nb * sizeof *nbuf, 1);
+	if(nbuf == nil){
+		tab_seterror("tab_rowmap: out of memory growing buckets");
 		return -1;
 	}
+	for(i = 0; i < old; i++){
+		for(e = t->buckets[i]; e != nil; e = next){
+			next = e->next;
+			e->next = nbuf[e->hash & (nb - 1)];
+			nbuf[e->hash & (nb - 1)] = e;
+		}
+	}
+	free(t->buckets);
+	t->buckets = nbuf;
 	t->mask = nb - 1;
 	return 0;
 }

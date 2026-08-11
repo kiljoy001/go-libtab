@@ -61,6 +61,27 @@ next_col(Ndbtuple **ptp, Ndbtuple **col_tuple_out)
 	return 0;
 }
 
+/* Free one column's strings. Used on the error paths in schema parsing,
+ * where a column has been built but not yet counted in schema.ncols --
+ * tab_close only frees cols[0..ncols-1], so anything rejected after
+ * collect_col_metadata succeeds would otherwise leak. */
+static void
+free_col(TabCol *c)
+{
+	int j;
+
+	if(c == nil)
+		return;
+	free(c->name);
+	free(c->type);
+	for(j = 0; j < c->nattrs; j++){
+		free(c->attrs[j].key);
+		free(c->attrs[j].val);
+	}
+	free(c->attrs);
+	memset(c, 0, sizeof *c);
+}
+
 /* For a given `col=` tuple, walk the same-line ring and call back
  * for every sibling attribute (i.e. everything on that line except
  * the `col=` tuple itself).  `type=` is recognised by the schema
@@ -94,6 +115,7 @@ collect_col_metadata(Ndbtuple *coltup, TabCol *out)
 		out->attrs = mallocz(nattrs * sizeof *out->attrs, 1);
 		if(out->attrs == nil){
 			tab_seterror("tab_open: out of memory for column attrs");
+			free_col(out);
 			return -1;
 		}
 	}
@@ -107,6 +129,8 @@ collect_col_metadata(Ndbtuple *coltup, TabCol *out)
 			out->type = strdup(line->val);
 			if(out->type == nil){
 				tab_seterror("tab_open: out of memory for type");
+				out->nattrs = i;
+				free_col(out);
 				return -1;
 			}
 			continue;
@@ -115,6 +139,8 @@ collect_col_metadata(Ndbtuple *coltup, TabCol *out)
 		out->attrs[i].val = strdup(line->val);
 		if(out->attrs[i].key == nil || out->attrs[i].val == nil){
 			tab_seterror("tab_open: out of memory for attr %d", i);
+			out->nattrs = i + 1;	/* free the partial pair too */
+			free_col(out);
 			return -1;
 		}
 		i++;
@@ -169,12 +195,14 @@ extract_schema(Tab *t, Ndbtuple *entry)
 		if(t->schema.cols[t->schema.ncols].name[0] == '\0'){
 			tab_seterror("tab_open: schema %q has empty column name",
 				t->schema.name);
+			free_col(&t->schema.cols[t->schema.ncols]);
 			return -1;
 		}
 		if(!schema_type_ok(t->schema.cols[t->schema.ncols].type)){
 			tab_seterror("tab_open: column %q has unsupported type %q",
 				t->schema.cols[t->schema.ncols].name,
 				t->schema.cols[t->schema.ncols].type);
+			free_col(&t->schema.cols[t->schema.ncols]);
 			return -1;
 		}
 		for(n = 0; n < t->schema.ncols; n++){
@@ -182,6 +210,7 @@ extract_schema(Tab *t, Ndbtuple *entry)
 			    t->schema.cols[t->schema.ncols].name) == 0){
 				tab_seterror("tab_open: duplicate column %q",
 					t->schema.cols[t->schema.ncols].name);
+				free_col(&t->schema.cols[t->schema.ncols]);
 				return -1;
 			}
 		}
