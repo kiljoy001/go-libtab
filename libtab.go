@@ -47,6 +47,10 @@ type Table struct {
 	Rows   []*Row
 
 	ptr *C.Tab
+
+	// byPtr maps a C row to its position in Rows, so an insert does not have
+	// to scan the slice to find out whether the row is already there.
+	byPtr map[*C.TabRow]int
 }
 
 func lastError() error {
@@ -210,10 +214,36 @@ func (t *Table) AddRow(values map[string]string) (*Row, error) {
 			return nil, err
 		}
 	}
-	if err := t.reloadRows(); err != nil {
-		return nil, err
+	/*
+	 * The C library maintains its own index as rows arrive, so the Go-side
+	 * slice only needs the new row appended. Rebuilding it here made n
+	 * inserts cost O(n^2): every AddRow walked the whole table and
+	 * allocated a Row, with a cgo call per column, for every existing row.
+	 */
+	fresh := t.rowFromPtr(rowPtr)
+	if existing := t.rowIndexOf(rowPtr); existing >= 0 {
+		// tab_add_row is idempotent for an identical row, so a repeated
+		// add updates in place rather than growing the slice.
+		t.Rows[existing] = fresh
+	} else {
+		if t.byPtr == nil {
+			t.byPtr = make(map[*C.TabRow]int, len(t.Rows)+1)
+		}
+		t.byPtr[rowPtr] = len(t.Rows)
+		t.Rows = append(t.Rows, fresh)
 	}
-	return t.rowFromPtr(rowPtr), nil
+	return fresh, nil
+}
+
+// rowIndexOf reports where a C row sits in the Rows slice, or -1.
+func (t *Table) rowIndexOf(ptr *C.TabRow) int {
+	if t.byPtr == nil {
+		return -1
+	}
+	if i, ok := t.byPtr[ptr]; ok {
+		return i
+	}
+	return -1
 }
 
 func (t *Table) Set(row *Row, col, value string) error {
@@ -250,13 +280,16 @@ func (t *Table) Search(col, val string) []*Row {
 	defer C.tab_iter_close(it)
 
 	var rows []*Row
+	byPtr := make(map[*C.TabRow]int)
 	for {
 		rowPtr := C.tab_iter_next(it)
 		if rowPtr == nil {
 			break
 		}
+		byPtr[rowPtr] = len(rows)
 		rows = append(rows, t.rowFromPtr(rowPtr))
 	}
+	t.byPtr = byPtr
 	return rows
 }
 
@@ -368,13 +401,16 @@ func (t *Table) reloadRows() error {
 	defer C.tab_iter_close(it)
 
 	var rows []*Row
+	byPtr := make(map[*C.TabRow]int)
 	for {
 		rowPtr := C.tab_iter_next(it)
 		if rowPtr == nil {
 			break
 		}
+		byPtr[rowPtr] = len(rows)
 		rows = append(rows, t.rowFromPtr(rowPtr))
 	}
+	t.byPtr = byPtr
 	t.Rows = rows
 	return nil
 }
